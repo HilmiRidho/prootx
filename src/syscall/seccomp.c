@@ -38,6 +38,7 @@
 #include <stddef.h>        /* offsetof(3), */
 #include <stdint.h>        /* uint*_t, UINT*_MAX, */
 #include <assert.h>        /* assert(3), */
+#include <stdlib.h>        /* qsort(3), malloc(3), free(3), */
 
 #include "syscall/seccomp.h"
 #include "tracee/tracee.h"
@@ -89,45 +90,107 @@ static int add_statements(struct sock_fprog *program, size_t nb_statements,
 	return 0;
 }
 
-/**
- * Append to @program->filter the statements required to notify PRoot
- * about the given @syscall made by a tracee, with the given @flag.
- * This function returns -errno if an error occurred, otherwise 0.
- */
-static int add_trace_syscall(struct sock_fprog *program, word_t syscall, int flag)
+/* BEGIN bpf tree */
+
+/* A filtered syscall of one architecture section.  */
+typedef struct {
+	uint32_t nr;	/* Architecture specific syscall number.  */
+	uint32_t flags;	/* FILTER_* flags reported to the tracer.  */
+	size_t order;	/* Position in the original list.  */
+} TracedSyscall;
+
+/* Sort by syscall number, then by original position, so that the first
+ * occurrence of a duplicated number is the one kept (as the former
+ * linear filter, which stopped at the first match).  */
+static int compare_traced_syscalls(const void *a, const void *b)
 {
-	int status;
+	const TracedSyscall *x = a, *y = b;
 
-	/* Sanity check.  */
-	if (syscall > UINT32_MAX)
-		return -ERANGE;
-
-	#define LENGTH_TRACE_SYSCALL 2
-	struct sock_filter statements[LENGTH_TRACE_SYSCALL] = {
-		/* Compare the accumulator with the expected syscall:
-		 * skip the next statement if not equal.  */
-		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall, 0, 1),
-
-		/* Notify the tracer.  */
-		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE + flag)
-	};
-
-	DEBUG_FILTER("FILTER:     trace if syscall == %ld\n", syscall);
-
-	status = add_statements(program, LENGTH_TRACE_SYSCALL, statements);
-	if (status < 0)
-		return status;
-
+	if (x->nr != y->nr)
+		return x->nr < y->nr ? -1 : 1;
+	if (x->order != y->order)
+		return x->order < y->order ? -1 : 1;
 	return 0;
 }
 
+/* Up to this number of syscalls, a linear chain is as fast as a
+ * further dichotomy step.  */
+#define LEAF_MAX 4
+
+/**
+ * Number of BPF statements emitted by emit_syscall_tree() for @n
+ * syscalls.
+ */
+static size_t syscall_tree_length(size_t n)
+{
+	if (n == 0)
+		return 0;
+
+	/* JEQ+RET for each syscall, then a jump to the end of the section.  */
+	if (n <= LEAF_MAX)
+		return 2 * n + 1;
+
+	/* JGE, jump over the left side, left side, right side.  */
+	return 2 + syscall_tree_length(n / 2) + syscall_tree_length(n - n / 2);
+}
+
+/**
+ * Write to @out the BPF statements that trace the (sorted, unique)
+ * @syscalls, as a binary search tree: each syscall costs about
+ * log2(n) comparisons instead of n for the former linear chain, and
+ * this cost is paid on *every* syscall of every tracee, traced or not.
+ * @remaining is the number of statements between the end of this tree
+ * and the final "allow" statement.  This function returns the number
+ * of statements written.
+ */
+static size_t emit_syscall_tree(struct sock_filter *out, const TracedSyscall *syscalls,
+				size_t n, size_t remaining)
+{
+	size_t length = 0;
+	size_t i;
+
+	if (n == 0)
+		return 0;
+
+	if (n <= LEAF_MAX) {
+		for (i = 0; i < n; i++) {
+			/* Skip the next statement if not the expected syscall.  */
+			out[length++] = (struct sock_filter) BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K,
+								syscalls[i].nr, 0, 1);
+			/* Notify the tracer.  */
+			out[length++] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K,
+								SECCOMP_RET_TRACE + syscalls[i].flags);
+		}
+		/* Not traced: allow.  */
+		out[length++] = (struct sock_filter) BPF_STMT(BPF_JMP + BPF_JA + BPF_K, remaining);
+		return length;
+	}
+	else {
+		const size_t left_n = n / 2;
+		const size_t left_length = syscall_tree_length(left_n);
+		const size_t right_length = syscall_tree_length(n - left_n);
+
+		/* Right side if syscall >= pivot (unsigned), otherwise
+		 * skip the jump below and go to the left side.  */
+		out[length++] = (struct sock_filter) BPF_JUMP(BPF_JMP + BPF_JGE + BPF_K,
+							syscalls[left_n].nr, 0, 1);
+		out[length++] = (struct sock_filter) BPF_STMT(BPF_JMP + BPF_JA + BPF_K, left_length);
+
+		length += emit_syscall_tree(out + length, syscalls, left_n, remaining + right_length);
+		length += emit_syscall_tree(out + length, syscalls + left_n, n - left_n, remaining);
+		return length;
+	}
+}
+
+/* END bpf tree */
+
 /**
  * Append to @program->filter the statements that allow anything (if
- * unfiltered).  Note that @nb_traced_syscalls is used to make a
- * sanity check.  This function returns -errno if an error occurred,
+ * unfiltered).  Note that @tree_length is used to make a sanity
+ * check.  This function returns -errno if an error occurred,
  * otherwise 0.
  */
-static int end_arch_section(struct sock_fprog *program, size_t nb_traced_syscalls)
+static int end_arch_section(struct sock_fprog *program, size_t tree_length)
 {
 	int status;
 
@@ -144,7 +207,7 @@ static int end_arch_section(struct sock_fprog *program, size_t nb_traced_syscall
 
 	/* Sanity check, see start_arch_section().  */
 	if (   talloc_array_length(program->filter) - program->len
-	    != LENGTH_END_SECTION + nb_traced_syscalls * LENGTH_TRACE_SYSCALL)
+	    != LENGTH_END_SECTION + tree_length)
 		return -ERANGE;
 
 	return 0;
@@ -152,16 +215,15 @@ static int end_arch_section(struct sock_fprog *program, size_t nb_traced_syscall
 
 /**
  * Append to @program->filter the statements that check the current
- * @architecture.  Note that @nb_traced_syscalls is used to make a
- * sanity check.  This function returns -errno if an error occurred,
+ * @architecture.  Note that @tree_length is used to make a sanity
+ * check.  This function returns -errno if an error occurred,
  * otherwise 0.
  */
-static int start_arch_section(struct sock_fprog *program, uint32_t arch, size_t nb_traced_syscalls)
+static int start_arch_section(struct sock_fprog *program, uint32_t arch, size_t tree_length)
 {
 	const size_t arch_offset    = offsetof(struct seccomp_data, arch);
 	const size_t syscall_offset = offsetof(struct seccomp_data, nr);
-	const size_t section_length = LENGTH_END_SECTION +
-					nb_traced_syscalls * LENGTH_TRACE_SYSCALL;
+	const size_t section_length = LENGTH_END_SECTION + tree_length;
 	int status;
 
 	/* Sanity checks.  */
@@ -190,8 +252,8 @@ static int start_arch_section(struct sock_fprog *program, uint32_t arch, size_t 
 		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, syscall_offset)
 	};
 
-	DEBUG_FILTER("FILTER: if arch == %ld, up to %zdth statement\n",
-		arch, nb_traced_syscalls);
+	DEBUG_FILTER("FILTER: if arch == %ld, %zd statements\n",
+		arch, tree_length);
 
 	status = add_statements(program, LENGTH_START_SECTION, statements);
 	if (status < 0)
@@ -256,7 +318,12 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 	size_t nb_archs = sizeof(seccomp_archs) / sizeof(SeccompArch);
 
 	struct sock_fprog program = { .len = 0, .filter = NULL };
+	TracedSyscall *traced = NULL;
+	struct sock_filter *tree = NULL;
 	size_t nb_traced_syscalls;
+	size_t nb_unique;
+	size_t tree_length;
+	size_t nb_sysnums;
 	size_t i, j, k;
 	int status;
 
@@ -264,44 +331,82 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 	if (status < 0)
 		goto end;
 
+	for (nb_sysnums = 0; sysnums[nb_sysnums].value != PR_void; nb_sysnums++)
+		;
+
 	/* For each handled architectures */
 	for (i = 0; i < nb_archs; i++) {
 		word_t syscall;
 
 		nb_traced_syscalls = 0;
 
-		/* Pre-compute the number of traced syscalls for this architecture.  */
-		for (j = 0; j < seccomp_archs[i].nb_abis; j++) {
-			for (k = 0; sysnums[k].value != PR_void; k++) {
-				syscall = detranslate_sysnum(seccomp_archs[i].abis[j], sysnums[k].value);
-				if (syscall != SYSCALL_AVOIDER)
-					nb_traced_syscalls++;
-			}
+		traced = malloc((seccomp_archs[i].nb_abis * nb_sysnums + 1) * sizeof(TracedSyscall));
+		if (traced == NULL) {
+			status = -ENOMEM;
+			goto end;
 		}
 
-		/* Filter: if handled architecture */
-		status = start_arch_section(&program, seccomp_archs[i].value, nb_traced_syscalls);
-		if (status < 0)
-			goto end;
-
+		/* Collect the syscalls to trace for this architecture.  */
 		for (j = 0; j < seccomp_archs[i].nb_abis; j++) {
-			for (k = 0; sysnums[k].value != PR_void; k++) {
+			for (k = 0; k < nb_sysnums; k++) {
 				/* Get the architecture specific syscall number.  */
 				syscall = detranslate_sysnum(seccomp_archs[i].abis[j], sysnums[k].value);
 				if (syscall == SYSCALL_AVOIDER)
 					continue;
 
-				/* Filter: trace if handled syscall */
-				status = add_trace_syscall(&program, syscall, sysnums[k].flags);
-				if (status < 0)
+				/* Sanity check.  */
+				if (syscall > UINT32_MAX) {
+					status = -ERANGE;
 					goto end;
+				}
+
+				traced[nb_traced_syscalls].nr    = (uint32_t) syscall;
+				traced[nb_traced_syscalls].flags = (uint32_t) sysnums[k].flags;
+				traced[nb_traced_syscalls].order = nb_traced_syscalls;
+				nb_traced_syscalls++;
 			}
 		}
 
-		/* Filter: allow untraced syscalls for this architecture */
-		status = end_arch_section(&program, nb_traced_syscalls);
+		/* Sort them and drop the duplicates, keeping the first
+		 * one like the former linear filter did.  */
+		qsort(traced, nb_traced_syscalls, sizeof(TracedSyscall), compare_traced_syscalls);
+		for (j = 0, nb_unique = 0; j < nb_traced_syscalls; j++) {
+			if (nb_unique > 0 && traced[nb_unique - 1].nr == traced[j].nr)
+				continue;
+			traced[nb_unique++] = traced[j];
+		}
+
+		tree_length = syscall_tree_length(nb_unique);
+		tree = malloc((tree_length + 1) * sizeof(struct sock_filter));
+		if (tree == NULL) {
+			status = -ENOMEM;
+			goto end;
+		}
+
+		if (emit_syscall_tree(tree, traced, nb_unique, 0) != tree_length) {
+			status = -ERANGE;
+			goto end;
+		}
+
+		/* Filter: if handled architecture */
+		status = start_arch_section(&program, seccomp_archs[i].value, tree_length);
 		if (status < 0)
 			goto end;
+
+		/* Filter: trace if handled syscall */
+		status = add_statements(&program, tree_length, tree);
+		if (status < 0)
+			goto end;
+
+		/* Filter: allow untraced syscalls for this architecture */
+		status = end_arch_section(&program, tree_length);
+		if (status < 0)
+			goto end;
+
+		free(tree);
+		free(traced);
+		tree = NULL;
+		traced = NULL;
 	}
 
 	status = finalize_program_filter(&program);
@@ -323,6 +428,8 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 
 	status = 0;
 end:
+	free(tree);
+	free(traced);
 	free_program_filter(&program);
 	return status;
 }
@@ -371,7 +478,8 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_getxattr,		0 },
 	{ PR_inotify_add_watch,	0 },
 #ifdef __ANDROID__
-	{ PR_ioctl,		FILTER_SYSEXIT },
+	/* The exit stage is requested by the sysenter handler, only for the\n	 * few commands that need it (see PR_ioctl in syscall/enter.c).  */
+	{ PR_ioctl,		0 },
 #endif
 	{ PR_lchown,		0 },
 	{ PR_lchown32,		0 },

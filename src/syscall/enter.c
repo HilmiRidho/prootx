@@ -2975,6 +2975,7 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_ioctl: {
 		word_t cmd = peek_reg(tracee, CURRENT, SYSARG_2);
 		word_t arg = peek_reg(tracee, CURRENT, SYSARG_3);
+		bool need_exit = false;
 
 		/* SIOCGIFINDEX: Android often denies this with EACCES for
 		 * real interfaces (and loopback), so resolve the index in
@@ -3002,7 +3003,24 @@ int translate_syscall_enter(Tracee *tracee)
 
 		if (cmd == TCSETSF2)
 			poke_reg(tracee, SYSARG_2, TCSETS);
+
+		/* The command was rewritten above: the exit stage restores
+		 * the original registers.  */
+		if (cmd == TCSETS + 2 || cmd == TCGETS2 || cmd == TCSETS2
+		    || cmd == TCSETSW2 || cmd == TCSETSF2)
+			need_exit = true;
 #endif
+
+		/* ioctl(2) is far too frequent to stop at its exit stage
+		 * systematically: only FICLONE needs it (EACCES -> EOPNOTSUPP,
+		 * see translate_syscall_exit()).  */
+		if (cmd == _IOW(0x94, 9, int) /* FICLONE */)
+			need_exit = true;
+
+		if (need_exit) {
+			tracee->sysexit_pending = true;
+			tracee->restart_how = PTRACE_SYSCALL;
+		}
 
 		break;
 	}
